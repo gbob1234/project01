@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: base-image-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: base-image-test
+  template:
+    metadata:
+      labels:
+        app: base-image-test
+    spec:
+      containers:
+        - name: base-image-test
+          image: harbor.example.com/ai/base-image-test:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - containerPort: 8000
+
+          command:
+            - uvicorn
+
+          args:
+            - app:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: base-image-test
+spec:
+  type: NodePort
+  selector:
+    app: base-image-test
+
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      nodePort: 30080
