@@ -81,7 +81,8 @@ def _oracle_merge_sql(table_name: str) -> str:
                 :4 AS LENGTH_VALUE,
                 :5 AS PIXEL_VALUE,
                 :6 AS DIA_VALUE,
-                :7 AS ROW_ORDER_VALUE
+                :7 AS ROW_ORDER_VALUE,
+                :8 AS BASE_DT_VALUE
             FROM DUAL
         ) S
         ON (
@@ -89,6 +90,7 @@ def _oracle_merge_sql(table_name: str) -> str:
             AND T.MS_CODE = S.MS_CODE
             AND T.CLASS_TYPE = S.CLASS_TYPE
             AND T.ROW_ORDER = S.ROW_ORDER_VALUE
+            AND T.BASE_DT = S.BASE_DT_VALUE
         )
         WHEN MATCHED THEN
             UPDATE SET
@@ -103,7 +105,8 @@ def _oracle_merge_sql(table_name: str) -> str:
                 LENGTH,
                 PIXEL,
                 DIA,
-                ROW_ORDER
+                ROW_ORDER,
+                BASE_DT
             )
             VALUES (
                 S.LOT_ID,
@@ -112,7 +115,8 @@ def _oracle_merge_sql(table_name: str) -> str:
                 S.LENGTH_VALUE,
                 S.PIXEL_VALUE,
                 S.DIA_VALUE,
-                S.ROW_ORDER_VALUE
+                S.ROW_ORDER_VALUE,
+                S.BASE_DT_VALUE
             )
     """
 
@@ -180,6 +184,7 @@ def _measurement_rows(pdf: Any, file_name: str) -> list[tuple[Any, ...]]:
                 int(row.BodyPixel),
                 Decimal(str(row.Body)),
                 position - body_count - 1,
+                str(row.base_dt),
             )
         )
 
@@ -197,6 +202,7 @@ def _measurement_rows(pdf: Any, file_name: str) -> list[tuple[Any, ...]]:
                 int(row.TailPixel),
                 Decimal(str(row.Tail)),
                 position,
+                str(row.base_dt),
             )
         )
 
@@ -260,6 +266,7 @@ def process_csv_partition(path_rows: Iterator[Any]) -> None:
             file_name = path_row.file_name
             version_id = path_row.version_id
             pdf = _read_s3_csv(s3_client, path, version_id)
+            pdf["base_dt"] = path_row.base_dt
             oracle_rows = _measurement_rows(pdf, file_name)
 
             if oracle_rows:
@@ -308,6 +315,7 @@ def parse_file_metadata_stream(
             & F.col("fileName").isNotNull()
             & F.col("bucket").isNotNull()
             & F.col("objectKey").isNotNull()
+            & F.col("uploadedAt").rlike(r"^\d{4}-\d{2}-\d{2}")
         )
     )
 
@@ -327,6 +335,13 @@ def process_csv_batch(batch_df: DataFrame, batch_id: int) -> None:
             ).alias("path"),
             F.col("fileName").alias("file_name"),
             F.col("versionId").alias("version_id"),
+            # Keep the calendar date carried by uploadedAt itself. Extracting
+            # the ISO date avoids a Spark session-timezone date rollover.
+            F.regexp_replace(
+                F.substring(F.col("uploadedAt"), 1, 10),
+                "-",
+                "",
+            ).alias("base_dt"),
         )
         # eventId is deterministic for device + bucket + key + checksum.
         .dropDuplicates(["eventId"])
@@ -335,9 +350,12 @@ def process_csv_batch(batch_df: DataFrame, batch_id: int) -> None:
         .coalesce(1)
     )
 
-    paths_df.select("path", "file_name", "version_id").foreachPartition(
-        process_csv_partition
-    )
+    paths_df.select(
+        "path",
+        "file_name",
+        "version_id",
+        "base_dt",
+    ).foreachPartition(process_csv_partition)
 
 
 def start_csv_oracle_query(
