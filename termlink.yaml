@@ -1,0 +1,289 @@
+# ============================================================
+# Secret
+# ============================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: webapp-secret
+type: Opaque
+stringData:
+  PG_DB: "mydb"
+  PG_USER: "myuser"
+  PG_PASSWORD: "change-me"
+
+
+---
+# ============================================================
+# ConfigMap
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webapp-config
+data:
+  DJANGO_SETTINGS_MODULE: "config.settings.prod"
+
+  # 같은 Pod 안의 PostgreSQL
+  PG_HOST: "127.0.0.1"
+  PG_PORT: "5432"
+
+  # 같은 Pod 안의 Backend
+  BACKEND_ORIGIN: "http://127.0.0.1:8000"
+
+
+---
+# ============================================================
+# PostgreSQL PVC
+#
+# Deployment에서는 volumeClaimTemplates를 사용할 수 없으므로
+# PVC를 별도로 생성
+# ============================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: webapp-pgdata
+spec:
+  accessModes:
+    - ReadWriteOnce
+
+  # 실제 사용 중인 StorageClass로 변경
+  storageClassName: powerstore
+
+  resources:
+    requests:
+      storage: 20Gi
+
+
+---
+# ============================================================
+# Deployment
+#
+# 1 Pod 안에:
+#   - pgvector
+#   - Django + Gunicorn
+#   - nginx frontend
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+
+spec:
+  replicas: 1
+
+  strategy:
+    # PostgreSQL PVC가 RWO이고 replica=1이므로
+    # 기존 Pod가 종료된 후 새 Pod를 띄우도록 설정
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: webapp
+
+  template:
+    metadata:
+      labels:
+        app: webapp
+
+    spec:
+      containers:
+
+        # ====================================================
+        # PostgreSQL + pgvector
+        # ====================================================
+        - name: db
+          image: harbor.example.com/library/pgvector:pg16
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: webapp-secret
+                  key: PG_DB
+
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: webapp-secret
+                  key: PG_USER
+
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: webapp-secret
+                  key: PG_PASSWORD
+
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - >
+                  pg_isready
+                  -U "$POSTGRES_USER"
+                  -d "$POSTGRES_DB"
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - >
+                  pg_isready
+                  -U "$POSTGRES_USER"
+                  -d "$POSTGRES_DB"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+
+
+        # ====================================================
+        # Django + Gunicorn Backend
+        # ====================================================
+        - name: backend
+          image: harbor.example.com/myproject/backend:version
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: backend
+              containerPort: 8000
+              protocol: TCP
+
+          env:
+            - name: DJANGO_SETTINGS_MODULE
+              valueFrom:
+                configMapKeyRef:
+                  name: webapp-config
+                  key: DJANGO_SETTINGS_MODULE
+
+            - name: PG_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: webapp-config
+                  key: PG_HOST
+
+            - name: PG_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: webapp-config
+                  key: PG_PORT
+
+            - name: PG_DB
+              valueFrom:
+                secretKeyRef:
+                  name: webapp-secret
+                  key: PG_DB
+
+            - name: PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: webapp-secret
+                  key: PG_USER
+
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: webapp-secret
+                  key: PG_PASSWORD
+
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+
+
+        # ====================================================
+        # Frontend nginx
+        # ====================================================
+        - name: frontend
+          image: harbor.example.com/myproject/frontend:version
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+
+          env:
+            - name: BACKEND_ORIGIN
+              valueFrom:
+                configMapKeyRef:
+                  name: webapp-config
+                  key: BACKEND_ORIGIN
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+
+
+      # ======================================================
+      # PostgreSQL PVC 연결
+      # ======================================================
+      volumes:
+        - name: pgdata
+          persistentVolumeClaim:
+            claimName: webapp-pgdata
+
+
+---
+# ============================================================
+# Frontend Service
+#
+# 사용자 → nginx :80
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: webapp
+
+spec:
+  type: ClusterIP
+
+  selector:
+    app: webapp
+
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
