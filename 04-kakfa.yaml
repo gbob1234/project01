@@ -1,0 +1,40 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: trino-dev-kafka-auth
+  namespace: ebigs
+spec:
+  refreshInterval: 1m
+
+  secretStoreRef:
+    name: openbao-trino-dev  # 실제 dev SecretStore 이름
+    kind: SecretStore
+
+  target:
+    name: trino-dev-kafka-auth
+    creationPolicy: Owner
+    deletionPolicy: Retain
+
+    template:
+      engineVersion: v2
+      type: Opaque
+      data:
+        kafka.properties: |
+          {{- if or (regexMatch "[[:cntrl:]]" .username) (regexMatch "[[:cntrl:]]" .password) -}}
+          {{- fail "Kafka credentials must not contain control characters" -}}
+          {{- end -}}
+          {{- $jaas := printf "org.apache.kafka.common.security.scram.ScramLoginModule required username=%s password=%s;" (.username | quote) (.password | quote) -}}
+          security.protocol=SASL_SSL
+          sasl.mechanism=SCRAM-SHA-512
+          sasl.jaas.config={{ $jaas | replace "\\" "\\\\" }}
+
+  data:
+    - secretKey: username
+      remoteRef:
+        key: aidp/dev/kafka/trino
+        property: username
+
+    - secretKey: password
+      remoteRef:
+        key: aidp/dev/kafka/trino
+        property: password
